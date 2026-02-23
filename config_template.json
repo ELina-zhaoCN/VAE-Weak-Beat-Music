@@ -1,0 +1,35 @@
+# FMA Filter Configuration Template
+# Copy this file to config.json and modify as needed
+
+{
+  "data_dir": "./fma_data",
+  "output_dir": "./weak_beat_music",
+  "audio_dir": "./fma_data/fma_medium",
+  
+  "weak_beat_genres": [
+    "Ambient",
+    "Drone",
+    "Experimental",
+    "Noise",
+    "Easy Listening",
+    "Sound Effects",
+    "Field Recordings",
+    "Spoken Word",
+    "New Age"
+  ],
+  
+  "local_folder_keywords": [
+    "ambient",
+    "drone",
+    "chill",
+    "meditation",
+    "atmospheric",
+    "experimental",
+    "noise",
+    "soundscape"
+  ],
+  
+  "preserve_directory_structure": false,
+  "save_statistics": true,
+  "statistics_file": "filtering_stats.json"
+}
