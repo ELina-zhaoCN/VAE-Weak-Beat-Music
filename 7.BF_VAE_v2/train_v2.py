@@ -39,9 +39,9 @@ for p in [
     if p not in sys.path:
         sys.path.insert(0, p)
 
-from audio_dataset import AudioMelDataset as MusicDataset
-from vae_model      import MelSpectrogramVAE as VAE
-from beat_loss_v2   import beat_loss_v2, compute_regularity_score
+from audio_dataset_v2 import AudioMelDataset_v2 as MusicDataset
+from vae_model        import MelSpectrogramVAE as VAE
+from beat_loss_v2     import beat_loss_v2, compute_regularity_score
 
 
 # ── argument parsing ──────────────────────────────────────────────────────────
@@ -68,37 +68,49 @@ def parse_args():
 
 
 # ── loss computation ──────────────────────────────────────────────────────────
+FREE_BITS = 0.5   # minimum KL nats per latent dim (anti-collapse)
+
 def compute_losses(recon, target, mu, logvar,
                    kl_w, beat_w, low_freq_cutoff):
     """
-    Frequency-split reconstruction loss + KL + beat loss v2.
+    Frequency-split reconstruction loss + KL (with free bits) + beat loss v2.
+
+    Anti-collapse: free bits ensures each latent dim contributes at least
+    FREE_BITS nats of KL, preventing posterior collapse even with low kl_w.
 
     recon/target: (B, 1, 128, 431)
     Returns: total_loss, dict of components
     """
-    # High-freq MSE (preserve melody/timbre, bands >= low_freq_cutoff)
+    # High-freq MSE: preserve melody/timbre (bands >= low_freq_cutoff)
     recon_high  = recon[:, :, low_freq_cutoff:, :]
     target_high = target[:, :, low_freq_cutoff:, :]
     recon_loss  = nn.functional.mse_loss(recon_high, target_high)
 
-    # Small all-freq MSE anchor so model doesn't go completely wild on low-freq
+    # Small all-freq anchor so low-freq doesn't go completely wild
     recon_loss_all = nn.functional.mse_loss(recon, target)
     recon_loss = 0.7 * recon_loss + 0.3 * recon_loss_all
 
-    # KL divergence
-    kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
-    kl_loss = kl_loss / recon.size(0)
+    # KL divergence per latent dimension
+    kl_per_dim = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp())  # (B, latent_dim)
+    # Free bits: clamp minimum KL to FREE_BITS per dim (prevents collapse)
+    kl_per_dim = torch.clamp(kl_per_dim.mean(dim=0), min=FREE_BITS)
+    kl_loss = kl_per_dim.sum()
 
-    # Beat loss v2:  loss = 1 - regularity  →  minimise = STRONGER beats
+    # Beat loss v2: 1 - regularity → minimise = STRONGER beats
     b_loss = beat_loss_v2(recon)
 
     total = recon_loss + kl_w * kl_loss + beat_w * b_loss
+
+    # Collapse indicator: if mean KL << FREE_BITS, decoder is ignoring z
+    kl_raw = (-0.5 * (1 + logvar - mu.pow(2) - logvar.exp())).mean().item()
+
     return total, {
-        'total': total.item(),
-        'recon': recon_loss.item(),
-        'kl':    kl_loss.item(),
-        'beat':  b_loss.item(),
-        'regularity': 1.0 - b_loss.item(),   # human-readable beat score
+        'total':      total.item(),
+        'recon':      recon_loss.item(),
+        'kl':         kl_loss.item(),
+        'kl_raw':     kl_raw,           # for collapse monitoring
+        'beat':       b_loss.item(),
+        'regularity': 1.0 - b_loss.item(),
     }
 
 
@@ -136,7 +148,12 @@ def run_epoch(model, loader, optimizer, device, kl_w, beat_w,
 # ── main ──────────────────────────────────────────────────────────────────────
 def main():
     args = parse_args()
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    if torch.cuda.is_available():
+        device = torch.device('cuda')
+    elif torch.backends.mps.is_available():
+        device = torch.device('mps')   # Apple Silicon GPU
+    else:
+        device = torch.device('cpu')
     print(f'Device: {device}')
     os.makedirs(args.save_dir, exist_ok=True)
 
@@ -211,10 +228,13 @@ def main():
 
         if epoch % args.log_interval == 0 or epoch == 1 or epoch == args.epochs:
             elapsed = time.time() - t0
+            # Collapse warning: if kl_raw < 0.1 nats avg, latent code is being ignored
+            kl_warn = ' ⚠ KL COLLAPSE?' if val_m['kl_raw'] < 0.1 else ''
             print(f'Epoch {epoch:3d}/{args.epochs} '
-                  f'| train beat={train_m["beat"]:.4f} reg={train_m["regularity"]:.3f} '
-                  f'| val beat={val_m["beat"]:.4f} reg={val_m["regularity"]:.3f} '
-                  f'| beat_w={beat_w:.2f} | {elapsed:.0f}s{star}')
+                  f'| train reg={train_m["regularity"]:.3f} '
+                  f'| val reg={val_m["regularity"]:.3f} beat={val_m["beat"]:.4f} '
+                  f'kl_raw={val_m["kl_raw"]:.3f} '
+                  f'| beat_w={beat_w:.2f} | {elapsed:.0f}s{star}{kl_warn}')
 
     # Save training history
     with open(os.path.join(args.save_dir, 'history_v2.json'), 'w') as f:

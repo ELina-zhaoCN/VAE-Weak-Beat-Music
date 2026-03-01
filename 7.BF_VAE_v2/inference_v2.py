@@ -1,21 +1,18 @@
 #!/usr/bin/env python3
 """
-BF-VAE v2  ·  Inference / Beat Enhancement Test
-=================================================
-Input : weak-beat audio (MP3 / WAV / FLAC)
-Output: audio with stronger beat pattern
+BF-VAE v2  ·  Beat Enhancement Inference
+==========================================
+Handles ANY LENGTH audio input via overlap-add chunking:
+  1. Detect: is this weak-beat music? (per-chunk regularity score)
+  2. Enhance: run each chunk through the VAE
+  3. Reconstruct: crossfade chunks back into a full-length audio
 
 Usage:
     python inference_v2.py \
-        --input  path/to/ambient.mp3 \
-        --checkpoint  checkpoints_v2/best_model_v2.pth \
-        --output  output_with_beats.wav \
+        --input   /path/to/your_song.mp3 \
+        --checkpoint  7.BF_VAE_v2/checkpoints/best_model_v2.pth \
+        --output  output_enhanced.wav \
         --plot    comparison.png
-
-What it shows:
-    • Mel-spectrogram  (original vs reconstructed)
-    • Low-freq energy envelope + autocorrelation
-    • Beat regularity score and BPM before/after
 """
 
 import sys, os, argparse
@@ -29,7 +26,6 @@ import matplotlib.gridspec as gridspec
 import warnings
 warnings.filterwarnings('ignore')
 
-# ── project path setup ────────────────────────────────────────────────────────
 SCRIPT_DIR   = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, '..'))
 for p in [os.path.join(PROJECT_ROOT, '3.Model'), SCRIPT_DIR, PROJECT_ROOT]:
@@ -39,17 +35,19 @@ for p in [os.path.join(PROJECT_ROOT, '3.Model'), SCRIPT_DIR, PROJECT_ROOT]:
 from vae_model    import MelSpectrogramVAE as VAE
 from beat_loss_v2 import compute_regularity_score
 
-# ── audio constants ───────────────────────────────────────────────────────────
-SR         = 22050
-N_FFT      = 2048
-HOP_LENGTH = 512
-N_MELS     = 128
-DURATION   = 10
-N_FRAMES   = 431
-NORM_DIV   = 40.0
+SR          = 22050
+N_FFT       = 2048
+HOP_LENGTH  = 512
+N_MELS      = 128
+CHUNK_SEC   = 10.0
+N_FRAMES    = 431
+NORM_DIV    = 40.0
+OVERLAP_SEC = 2.5          # crossfade region on each side
+WEAK_BEAT_THRESHOLD = 0.45 # regularity score below this → classified as weak-beat
 
 
 # ── audio ↔ mel helpers ───────────────────────────────────────────────────────
+
 def audio_to_mel(y: np.ndarray) -> np.ndarray:
     S    = librosa.feature.melspectrogram(y=y, sr=SR, n_fft=N_FFT,
                                            hop_length=HOP_LENGTH, n_mels=N_MELS)
@@ -66,49 +64,125 @@ def mel_to_audio(mel_np: np.ndarray) -> np.ndarray:
         power, sr=SR, n_fft=N_FFT, hop_length=HOP_LENGTH, n_iter=64)
 
 
-def load_audio_clip(path: str, offset: float = 0.0) -> np.ndarray:
-    y, _ = librosa.load(path, sr=SR, duration=DURATION,
-                        offset=offset, mono=True)
-    target = SR * DURATION
-    if len(y) < target:
-        y = np.pad(y, (0, target - len(y)))
-    return y[:target]
+def load_full_audio(path: str) -> np.ndarray:
+    y, _ = librosa.load(path, sr=SR, mono=True)
+    return y
 
 
-# ── beat metrics ──────────────────────────────────────────────────────────────
-def get_bpm(y: np.ndarray) -> float:
-    tempo, _ = librosa.beat.beat_track(y=y, sr=SR, hop_length=HOP_LENGTH)
-    return float(tempo)
+# ── overlap-add chunking ──────────────────────────────────────────────────────
 
-
-def get_autocorr(mel_np: np.ndarray,
-                 n_low: int = 16) -> tuple[np.ndarray, np.ndarray]:
-    """Returns (acf, energy_envelope)."""
-    energy = np.mean(np.abs(mel_np[:n_low, :]), axis=0)
-    en = (energy - energy.mean()) / (energy.std() + 1e-8)
-    n  = len(en)
-    f  = np.fft.fft(en, n=2 * n)
-    acf = np.fft.ifft(f * np.conj(f)).real[:n]
-    acf = acf / (acf[0] + 1e-8)
-    return acf, energy
-
-
-# ── main inference function ───────────────────────────────────────────────────
-def enhance_beats(input_path: str,
-                  checkpoint_path: str,
-                  output_path: str = None,
-                  plot_path: str = None,
-                  offset: float = 0.0,
-                  latent_dim: int = 128,
-                  device_str: str = 'auto') -> dict:
+def chunk_audio(y: np.ndarray,
+                chunk_sec: float = CHUNK_SEC,
+                overlap_sec: float = OVERLAP_SEC) -> list:
     """
-    Load weak-beat audio → run through BF-VAE v2 → return beat-enhanced audio.
+    Split audio into overlapping chunks for VAE processing.
+    Returns list of (chunk_audio, start_sample, end_sample).
+    """
+    chunk_len   = int(chunk_sec * SR)
+    overlap_len = int(overlap_sec * SR)
+    hop_len     = chunk_len - 2 * overlap_len   # non-overlapping middle
+    total       = len(y)
 
-    Returns a dict with all metrics and numpy audio arrays.
+    chunks = []
+    start  = 0
+    while start < total:
+        end = min(start + chunk_len, total)
+        chunk = y[start:end]
+
+        # Zero-pad last chunk if short
+        if len(chunk) < chunk_len:
+            chunk = np.pad(chunk, (0, chunk_len - len(chunk)))
+
+        chunks.append((chunk, start, end))
+        if end >= total:
+            break
+        start += hop_len
+
+    return chunks
+
+
+def overlap_add(chunks_out: list, total_samples: int,
+                overlap_sec: float = OVERLAP_SEC) -> np.ndarray:
+    """
+    Crossfade-merge VAE output chunks back into full-length audio.
+    Uses raised-cosine envelope for smooth transitions.
+    """
+    overlap_len = int(overlap_sec * SR)
+    result      = np.zeros(total_samples, dtype=np.float32)
+    weight      = np.zeros(total_samples, dtype=np.float32)
+
+    fade_in  = (1 - np.cos(np.linspace(0, np.pi, overlap_len))) / 2
+    fade_out = fade_in[::-1]
+
+    for audio_out, start, end in chunks_out:
+        n = min(len(audio_out), end - start, total_samples - start)
+        env = np.ones(n, dtype=np.float32)
+
+        # Fade in at the start of the chunk
+        if start > 0:
+            fi = min(overlap_len, n)
+            env[:fi] *= fade_in[:fi]
+
+        # Fade out at the end of the chunk
+        if end < total_samples:
+            fo = min(overlap_len, n)
+            env[-fo:] *= fade_out[-fo:]
+
+        result[start:start + n] += audio_out[:n] * env
+        weight[start:start + n] += env
+
+    # Normalize by accumulated weights
+    weight = np.maximum(weight, 1e-6)
+    return result / weight
+
+
+# ── detection ─────────────────────────────────────────────────────────────────
+
+def detect_beat_strength(y: np.ndarray, chunk_sec: float = CHUNK_SEC) -> dict:
+    """
+    Analyse the full audio and return per-chunk and overall beat regularity.
+    Does NOT run the VAE — just measures the input.
+    """
+    chunks = chunk_audio(y, chunk_sec, overlap_sec=0.0)
+    scores = []
+    for chunk, _, _ in chunks:
+        mel = audio_to_mel(chunk)
+        t   = torch.FloatTensor(mel).unsqueeze(0).unsqueeze(0)
+        scores.append(compute_regularity_score(t))
+
+    avg = float(np.mean(scores))
+    return {
+        'per_chunk_scores': scores,
+        'mean_regularity':  avg,
+        'is_weak_beat':     avg < WEAK_BEAT_THRESHOLD,
+        'verdict': ('WEAK BEAT ✓ — enhancement recommended'
+                    if avg < WEAK_BEAT_THRESHOLD
+                    else 'STRONG BEAT — model may change rhythm'),
+    }
+
+
+# ── core enhancement ──────────────────────────────────────────────────────────
+
+def enhance_beats(
+    input_path:      str,
+    checkpoint_path: str,
+    output_path:     str  = None,
+    plot_path:       str  = None,
+    latent_dim:      int  = 128,
+    device_str:      str  = 'auto',
+) -> dict:
+    """
+    Full pipeline: load → detect → enhance (chunk-by-chunk) → reconstruct.
+    Returns dict with all metrics and numpy arrays.
     """
     # ── device ────────────────────────────────────────────────────────────
     if device_str == 'auto':
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        if torch.cuda.is_available():
+            device = torch.device('cuda')
+        elif torch.backends.mps.is_available():
+            device = torch.device('mps')
+        else:
+            device = torch.device('cpu')
     else:
         device = torch.device(device_str)
     print(f'Device: {device}')
@@ -119,156 +193,185 @@ def enhance_beats(input_path: str,
     state = ckpt.get('model_state_dict', ckpt)
     model.load_state_dict(state, strict=False)
     model.eval()
-    print(f'Model loaded from {checkpoint_path}')
+    print(f'Model: {checkpoint_path}')
 
-    # ── load & process input ──────────────────────────────────────────────
-    print(f'\nProcessing: {os.path.basename(input_path)}')
-    audio_in = load_audio_clip(input_path, offset=offset)
-    mel_in   = audio_to_mel(audio_in)
+    # ── load audio ────────────────────────────────────────────────────────
+    print(f'\nInput : {os.path.basename(input_path)}')
+    y_in  = load_full_audio(input_path)
+    dur   = len(y_in) / SR
+    print(f'Duration: {dur:.1f}s  ({int(dur//60)}m{int(dur%60):02d}s)')
 
-    mel_tensor = torch.FloatTensor(mel_in).unsqueeze(0).unsqueeze(0).to(device)
+    # ── detect beat strength BEFORE enhancement ────────────────────────────
+    print('\n[1/3] Analysing beat regularity...')
+    detection = detect_beat_strength(y_in)
+    print(f'  Mean regularity : {detection["mean_regularity"]:.3f}')
+    print(f'  Verdict         : {detection["verdict"]}')
+
+    # ── chunk → VAE → overlap-add ──────────────────────────────────────────
+    print(f'\n[2/3] Enhancing beats ({len(chunk_audio(y_in))} chunks)...')
+    chunks_in  = chunk_audio(y_in)
+    chunks_out = []
+    reg_out_scores = []
 
     with torch.no_grad():
-        mel_out_tensor, mu, logvar = model(mel_tensor)
-        if mel_out_tensor.shape[-1] != N_FRAMES:
-            mel_out_tensor = mel_out_tensor[:, :, :, :N_FRAMES]
+        for i, (chunk, start, end) in enumerate(chunks_in):
+            mel_in = audio_to_mel(chunk)                           # (128, 431)
+            t_in   = torch.FloatTensor(mel_in).unsqueeze(0).unsqueeze(0).to(device)
 
-    mel_out = mel_out_tensor.squeeze().cpu().numpy()
+            t_out, _, _ = model(t_in)
+            if t_out.shape[-1] != N_FRAMES:
+                t_out = t_out[:, :, :, :N_FRAMES]
 
-    # ── reconstruct audio ─────────────────────────────────────────────────
-    audio_out = mel_to_audio(mel_out)
+            mel_out    = t_out.squeeze().cpu().numpy()
+            audio_out  = mel_to_audio(mel_out)
+            reg_out_scores.append(compute_regularity_score(t_out.cpu()))
+
+            chunks_out.append((audio_out, start, end))
+            print(f'  Chunk {i+1:2d}/{len(chunks_in)}  '
+                  f'reg: {detection["per_chunk_scores"][i]:.3f} → '
+                  f'{reg_out_scores[-1]:.3f}')
+
+    # ── reconstruct full audio ─────────────────────────────────────────────
+    print('\n[3/3] Reconstructing full audio...')
+    y_out = overlap_add(chunks_out, len(y_in))
 
     # ── metrics ───────────────────────────────────────────────────────────
-    reg_in  = compute_regularity_score(mel_tensor.cpu())
-    reg_out = compute_regularity_score(mel_out_tensor.cpu())
-    bpm_in  = get_bpm(audio_in)
-    bpm_out = get_bpm(audio_out)
-    mse     = float(np.mean((mel_in - mel_out) ** 2))
+    reg_in  = detection['mean_regularity']
+    reg_out = float(np.mean(reg_out_scores))
 
-    acf_in,  env_in  = get_autocorr(mel_in)
-    acf_out, env_out = get_autocorr(mel_out)
+    try:
+        bpm_in,  _ = librosa.beat.beat_track(y=y_in,  sr=SR, hop_length=HOP_LENGTH)
+        bpm_out, _ = librosa.beat.beat_track(y=y_out, sr=SR, hop_length=HOP_LENGTH)
+        bpm_in, bpm_out = float(bpm_in), float(bpm_out)
+    except Exception:
+        bpm_in = bpm_out = 0.0
 
-    print(f'\n{"="*52}')
+    # MSE on mel (use first 10s for comparison)
+    mel_in_ref  = audio_to_mel(y_in[:int(CHUNK_SEC * SR)])
+    mel_out_ref = audio_to_mel(y_out[:int(CHUNK_SEC * SR)])
+    mse = float(np.mean((mel_in_ref - mel_out_ref) ** 2))
+
+    print(f'\n{"═"*54}')
+    print(f'  INPUT  : {detection["verdict"]}')
     print(f'  Beat Regularity : {reg_in:.3f}  →  {reg_out:.3f}  '
-          f'({"+" if reg_out>reg_in else ""}{reg_out-reg_in:+.3f})')
+          f'({reg_out - reg_in:+.3f})')
     print(f'  BPM             : {bpm_in:.1f}  →  {bpm_out:.1f}')
-    print(f'  MSE             : {mse:.4f}')
-    print(f'{"="*52}')
+    print(f'  MSE (10s ref)   : {mse:.4f}')
+    print(f'{"═"*54}')
 
     # ── save audio ────────────────────────────────────────────────────────
     if output_path:
-        sf.write(output_path, audio_out, SR)
-        print(f'\nOutput saved: {output_path}')
+        sf.write(output_path, y_out, SR)
+        print(f'\nSaved enhanced audio: {output_path}')
 
     # ── plot ──────────────────────────────────────────────────────────────
     if plot_path:
-        _plot_comparison(mel_in, mel_out, env_in, env_out, acf_in, acf_out,
-                         reg_in, reg_out, bpm_in, bpm_out, plot_path,
-                         title=os.path.basename(input_path))
-        print(f'Plot saved: {plot_path}')
+        _plot(y_in, y_out, mel_in_ref, mel_out_ref,
+              detection['per_chunk_scores'], reg_out_scores,
+              reg_in, reg_out, bpm_in, bpm_out,
+              detection['is_weak_beat'], plot_path,
+              title=os.path.basename(input_path))
+        print(f'Saved plot: {plot_path}')
 
     return {
-        'audio_in':   audio_in,
-        'audio_out':  audio_out,
-        'mel_in':     mel_in,
-        'mel_out':    mel_out,
+        'audio_in':   y_in,
+        'audio_out':  y_out,
         'reg_in':     reg_in,
         'reg_out':    reg_out,
         'reg_delta':  reg_out - reg_in,
         'bpm_in':     bpm_in,
         'bpm_out':    bpm_out,
         'mse':        mse,
+        'is_weak_beat': detection['is_weak_beat'],
+        'per_chunk_in':  detection['per_chunk_scores'],
+        'per_chunk_out': reg_out_scores,
     }
 
 
-def _plot_comparison(mel_in, mel_out, env_in, env_out, acf_in, acf_out,
-                     reg_in, reg_out, bpm_in, bpm_out, save_path, title=''):
-    fig = plt.figure(figsize=(16, 10))
-    gs  = gridspec.GridSpec(3, 2, figure=fig, hspace=0.45, wspace=0.35)
-    frames = np.arange(N_FRAMES)
+# ── plotting ──────────────────────────────────────────────────────────────────
 
-    # ── Row 0: Mel spectrograms ────────────────────────────────────────────
-    for col, (mel, label) in enumerate([(mel_in,  'Original (Weak Beat)'),
-                                         (mel_out, 'Enhanced (Strong Beat)')]):
-        ax = fig.add_subplot(gs[0, col])
-        librosa.display.specshow(mel * NORM_DIV, sr=SR, hop_length=HOP_LENGTH,
-                                  x_axis='time', y_axis='mel', ax=ax, cmap='magma')
-        ax.set_title(label, fontsize=11)
-        ax.set_xlabel('Time (s)')
-        ax.set_ylabel('Frequency (Mel)')
+def _plot(y_in, y_out, mel_in, mel_out,
+          scores_in, scores_out,
+          reg_in, reg_out, bpm_in, bpm_out,
+          is_weak, save_path, title=''):
 
-    # ── Row 1: Low-freq energy envelope ───────────────────────────────────
-    t = frames * HOP_LENGTH / SR
-    ax = fig.add_subplot(gs[1, :])
-    ax.plot(t, env_in,  alpha=0.8, label=f'Original  (regularity={reg_in:.3f})',  color='steelblue')
-    ax.plot(t, env_out, alpha=0.8, label=f'Enhanced  (regularity={reg_out:.3f})', color='tomato')
-    ax.set_title('Low-Frequency Energy Envelope (beat region: 0–250 Hz)', fontsize=11)
-    ax.set_xlabel('Time (s)')
-    ax.set_ylabel('Energy')
-    ax.legend(fontsize=9)
-    ax.grid(True, alpha=0.3)
+    fig = plt.figure(figsize=(16, 11))
+    gs  = gridspec.GridSpec(3, 2, figure=fig, hspace=0.5, wspace=0.35)
+    t_audio = np.linspace(0, len(y_in) / SR, len(y_in))
 
-    # ── Row 2: Autocorrelation ─────────────────────────────────────────────
-    # BPM range [60,240] → lag in frames
-    lag_min = max(1, int(round(SR / (HOP_LENGTH * 240 / 60))))
-    lag_max = min(N_FRAMES - 1, int(round(SR / (HOP_LENGTH * 60 / 60))))
-
-    lag_axis = np.arange(N_FRAMES) * HOP_LENGTH / SR
-    for col, (acf, label, color) in enumerate([
-        (acf_in,  f'Original  BPM≈{bpm_in:.0f}',  'steelblue'),
-        (acf_out, f'Enhanced  BPM≈{bpm_out:.0f}', 'tomato'),
+    # Row 0 – waveforms
+    for col, (y, label, color) in enumerate([
+        (y_in,  'Original waveform',  'steelblue'),
+        (y_out, 'Enhanced waveform',  'tomato'),
     ]):
-        ax = fig.add_subplot(gs[2, col])
-        ax.plot(lag_axis, acf, color=color, linewidth=1.2)
-        ax.axvspan(lag_min * HOP_LENGTH / SR, lag_max * HOP_LENGTH / SR,
-                   alpha=0.12, color='gold', label='60–240 BPM search window')
-        ax.set_xlim(0, lag_axis[lag_max + 10] if lag_max + 10 < len(lag_axis) else lag_axis[-1])
-        ax.set_title(f'Autocorrelation – {label}', fontsize=10)
-        ax.set_xlabel('Lag (s)')
-        ax.set_ylabel('Correlation')
-        ax.legend(fontsize=8)
-        ax.grid(True, alpha=0.3)
+        ax = fig.add_subplot(gs[0, col])
+        ax.plot(t_audio, y, color=color, linewidth=0.4, alpha=0.8)
+        ax.set_title(label, fontsize=10)
+        ax.set_xlabel('Time (s)')
+        ax.set_ylabel('Amplitude')
+        ax.set_xlim(0, t_audio[-1])
 
-    delta_str = f'{reg_out - reg_in:+.3f}'
-    fig.suptitle(f'{title}\n'
-                 f'Beat Regularity: {reg_in:.3f} → {reg_out:.3f} ({delta_str})   '
-                 f'BPM: {bpm_in:.1f} → {bpm_out:.1f}',
-                 fontsize=13, y=0.99)
+    # Row 1 – Mel spectrograms (first 10s)
+    for col, (mel, label) in enumerate([
+        (mel_in,  f'Mel (original) — reg={reg_in:.3f}'),
+        (mel_out, f'Mel (enhanced) — reg={reg_out:.3f}'),
+    ]):
+        ax = fig.add_subplot(gs[1, col])
+        librosa.display.specshow(mel * NORM_DIV, sr=SR, hop_length=HOP_LENGTH,
+                                  x_axis='time', y_axis='mel',
+                                  ax=ax, cmap='magma')
+        ax.set_title(label, fontsize=10)
+
+    # Row 2 – per-chunk beat regularity comparison
+    ax = fig.add_subplot(gs[2, :])
+    x = range(1, len(scores_in) + 1)
+    ax.bar([i - 0.2 for i in x], scores_in,  width=0.35,
+           color='steelblue', alpha=0.8, label='Original')
+    ax.bar([i + 0.2 for i in x], scores_out[:len(scores_in)], width=0.35,
+           color='tomato', alpha=0.8, label='Enhanced')
+    ax.axhline(WEAK_BEAT_THRESHOLD, color='gray', linestyle='--',
+               linewidth=1, label=f'Weak-beat threshold ({WEAK_BEAT_THRESHOLD})')
+    ax.set_xlabel('Chunk index')
+    ax.set_ylabel('Beat Regularity Score')
+    ax.set_title('Per-chunk beat regularity: Original vs Enhanced', fontsize=10)
+    ax.legend(fontsize=9)
+    ax.set_ylim(0, 1.05)
+    ax.grid(True, alpha=0.3, axis='y')
+
+    verdict = 'WEAK BEAT → Enhancement applied' if is_weak else 'STRONG BEAT detected'
+    fig.suptitle(
+        f'{title}  |  {verdict}\n'
+        f'Regularity: {reg_in:.3f} → {reg_out:.3f} ({reg_out-reg_in:+.3f})  '
+        f'BPM: {bpm_in:.1f} → {bpm_out:.1f}',
+        fontsize=12, y=1.0)
     fig.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close(fig)
 
 
-# ── CLI entry point ───────────────────────────────────────────────────────────
+# ── CLI ───────────────────────────────────────────────────────────────────────
+
 def parse_args():
-    p = argparse.ArgumentParser(description='BF-VAE v2 Beat Enhancement Inference')
-    p.add_argument('--input',      required=True,  help='Input weak-beat audio file')
-    p.add_argument('--checkpoint', required=True,  help='Path to best_model_v2.pth')
-    p.add_argument('--output',     default=None,   help='Save enhanced audio (.wav)')
-    p.add_argument('--plot',       default=None,   help='Save comparison plot (.png)')
-    p.add_argument('--offset',     type=float, default=0.0, help='Audio clip offset (s)')
-    p.add_argument('--latent_dim', type=int,   default=128)
-    p.add_argument('--device',     default='auto', help='cuda / cpu / auto')
+    p = argparse.ArgumentParser(description='BF-VAE v2 — Beat Enhancement')
+    p.add_argument('--input',      required=True)
+    p.add_argument('--checkpoint', required=True)
+    p.add_argument('--output',     default=None, help='Output .wav path')
+    p.add_argument('--plot',       default=None, help='Output .png path')
+    p.add_argument('--latent_dim', type=int, default=128)
+    p.add_argument('--device',     default='auto')
     return p.parse_args()
 
 
 if __name__ == '__main__':
-    args = parse_args()
+    args  = parse_args()
+    base  = os.path.splitext(os.path.basename(args.input))[0]
+    out_w = args.output or f'{base}_enhanced.wav'
+    out_p = args.plot   or f'{base}_comparison.png'
 
-    # Auto-generate output paths if not given
-    base    = os.path.splitext(os.path.basename(args.input))[0]
-    out_wav = args.output or f'{base}_beat_enhanced.wav'
-    out_png = args.plot   or f'{base}_comparison.png'
-
-    results = enhance_beats(
+    enhance_beats(
         input_path      = args.input,
         checkpoint_path = args.checkpoint,
-        output_path     = out_wav,
-        plot_path       = out_png,
-        offset          = args.offset,
+        output_path     = out_w,
+        plot_path       = out_p,
         latent_dim      = args.latent_dim,
         device_str      = args.device,
     )
-
-    print(f'\nDone!')
-    print(f'  Output audio : {out_wav}')
-    print(f'  Plot         : {out_png}')
