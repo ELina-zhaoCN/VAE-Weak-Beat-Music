@@ -1,0 +1,228 @@
+#!/usr/bin/env python3
+"""
+BF-VAE v2 Fine-tune Training Script
+=====================================
+Three fixes over v1:
+  1. beat_loss direction: 1 - regularity  (v1 was regularity → trained WEAKER beats)
+  2. Frequency-split MSE: only apply MSE on bands >= LOW_FREQ_CUTOFF
+     → model is free to modify low-freq rhythm while preserving melody
+  3. KL weight: default 0.01 (v1 was 0.001, nearly disabled)
+
+Usage (Colab):
+  python train_v2.py \
+      --data_dir /content/fma_test_audio \
+      --checkpoint ../BF_VAE_results/checkpoints_v2/best_model.pth \
+      --save_dir   /content/drive/MyDrive/BF_VAE_v2_results \
+      --epochs 40 \
+      --beat_weight 2.0 \
+      --kl_weight   0.01
+"""
+
+import sys, os, argparse, json, time
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, random_split
+from tqdm import tqdm
+
+# ── resolve project paths ─────────────────────────────────────────────────────
+SCRIPT_DIR   = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, '..'))
+
+for p in [
+    os.path.join(PROJECT_ROOT, '2.Music_dataset'),
+    os.path.join(PROJECT_ROOT, '3.Model'),
+    SCRIPT_DIR,
+    PROJECT_ROOT,
+]:
+    if p not in sys.path:
+        sys.path.insert(0, p)
+
+from audio_dataset import AudioMelDataset as MusicDataset
+from vae_model      import MelSpectrogramVAE as VAE
+from beat_loss_v2   import beat_loss_v2, compute_regularity_score
+
+
+# ── argument parsing ──────────────────────────────────────────────────────────
+def parse_args():
+    p = argparse.ArgumentParser(description='BF-VAE v2 Fine-tune')
+    p.add_argument('--data_dir',    required=True,  help='Weak-beat audio folder')
+    p.add_argument('--checkpoint',  default=None,   help='Path to v1 .pth checkpoint (fine-tune)')
+    p.add_argument('--save_dir',    default='./checkpoints_v2', help='Output folder')
+    p.add_argument('--epochs',      type=int,   default=40)
+    p.add_argument('--batch_size',  type=int,   default=16)
+    p.add_argument('--lr',          type=float, default=5e-5,
+                   help='Use lower LR for fine-tuning (5e-5); from scratch: 1e-4')
+    p.add_argument('--latent_dim',  type=int,   default=128)
+    p.add_argument('--kl_weight',   type=float, default=0.01,
+                   help='KL weight (was 0.001 in v1; 0.01 gives gentle regularisation)')
+    p.add_argument('--beat_weight', type=float, default=2.0,
+                   help='Beat loss weight (higher = stronger beat push; recommend 1.5-3.0)')
+    p.add_argument('--warmup_epochs', type=int, default=10,
+                   help='Epochs to ramp beat_weight from 0 to target')
+    p.add_argument('--low_freq_cutoff', type=int, default=16,
+                   help='MSE applied only to mel bands >= this (frees low-freq for beat)')
+    p.add_argument('--log_interval', type=int, default=5, help='Print every N epochs')
+    return p.parse_args()
+
+
+# ── loss computation ──────────────────────────────────────────────────────────
+def compute_losses(recon, target, mu, logvar,
+                   kl_w, beat_w, low_freq_cutoff):
+    """
+    Frequency-split reconstruction loss + KL + beat loss v2.
+
+    recon/target: (B, 1, 128, 431)
+    Returns: total_loss, dict of components
+    """
+    # High-freq MSE (preserve melody/timbre, bands >= low_freq_cutoff)
+    recon_high  = recon[:, :, low_freq_cutoff:, :]
+    target_high = target[:, :, low_freq_cutoff:, :]
+    recon_loss  = nn.functional.mse_loss(recon_high, target_high)
+
+    # Small all-freq MSE anchor so model doesn't go completely wild on low-freq
+    recon_loss_all = nn.functional.mse_loss(recon, target)
+    recon_loss = 0.7 * recon_loss + 0.3 * recon_loss_all
+
+    # KL divergence
+    kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+    kl_loss = kl_loss / recon.size(0)
+
+    # Beat loss v2:  loss = 1 - regularity  →  minimise = STRONGER beats
+    b_loss = beat_loss_v2(recon)
+
+    total = recon_loss + kl_w * kl_loss + beat_w * b_loss
+    return total, {
+        'total': total.item(),
+        'recon': recon_loss.item(),
+        'kl':    kl_loss.item(),
+        'beat':  b_loss.item(),
+        'regularity': 1.0 - b_loss.item(),   # human-readable beat score
+    }
+
+
+# ── training / validation loops ───────────────────────────────────────────────
+def run_epoch(model, loader, optimizer, device, kl_w, beat_w,
+              low_freq_cutoff, train=True):
+    model.train(train)
+    totals = {'total': 0, 'recon': 0, 'kl': 0, 'beat': 0, 'regularity': 0}
+    n = 0
+
+    ctx = torch.enable_grad() if train else torch.no_grad()
+    with ctx:
+        for batch in loader:
+            batch = batch.to(device)
+            recon, mu, logvar = model(batch)
+            if recon.size(-1) != batch.size(-1):
+                recon = recon[:, :, :, :batch.size(-1)]
+
+            loss, info = compute_losses(recon, batch, mu, logvar,
+                                        kl_w, beat_w, low_freq_cutoff)
+            if train:
+                optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+
+            bs = batch.size(0)
+            for k in totals:
+                totals[k] += info[k] * bs
+            n += bs
+
+    return {k: v / n for k, v in totals.items()}
+
+
+# ── main ──────────────────────────────────────────────────────────────────────
+def main():
+    args = parse_args()
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f'Device: {device}')
+    os.makedirs(args.save_dir, exist_ok=True)
+
+    # ── dataset ───────────────────────────────────────────────────────────
+    print('Loading dataset...')
+    dataset    = MusicDataset(data_dir=args.data_dir)
+    n_train    = int(0.85 * len(dataset))
+    n_val      = len(dataset) - n_train
+    train_ds, val_ds = random_split(dataset, [n_train, n_val])
+    print(f'Train: {n_train}  Val: {n_val}')
+
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size,
+                              shuffle=True,  num_workers=0, pin_memory=False)
+    val_loader   = DataLoader(val_ds,   batch_size=args.batch_size,
+                              shuffle=False, num_workers=0, pin_memory=False)
+
+    # ── model ─────────────────────────────────────────────────────────────
+    model = VAE(latent_dim=args.latent_dim).to(device)
+
+    if args.checkpoint and os.path.exists(args.checkpoint):
+        ckpt = torch.load(args.checkpoint, map_location=device)
+        state = ckpt.get('model_state_dict', ckpt)
+        model.load_state_dict(state, strict=False)
+        print(f'Loaded checkpoint: {args.checkpoint}')
+    else:
+        print('No checkpoint found – training from scratch.')
+
+    params = sum(p.numel() for p in model.parameters()) / 1e6
+    print(f'Model parameters: {params:.1f}M')
+
+    optimizer = optim.Adam(model.parameters(), lr=args.lr)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, patience=5, factor=0.5, verbose=True)
+
+    # ── training loop ─────────────────────────────────────────────────────
+    history     = []
+    best_reg    = -1.0
+    best_path   = os.path.join(args.save_dir, 'best_model_v2.pth')
+    latest_path = os.path.join(args.save_dir, 'latest_model_v2.pth')
+
+    for epoch in range(1, args.epochs + 1):
+        # Warm-up: linearly ramp beat_weight from 0 to target
+        if epoch <= args.warmup_epochs:
+            beat_w = args.beat_weight * epoch / args.warmup_epochs
+        else:
+            beat_w = args.beat_weight
+
+        t0 = time.time()
+        train_m = run_epoch(model, train_loader, optimizer, device,
+                            args.kl_weight, beat_w, args.low_freq_cutoff, train=True)
+        val_m   = run_epoch(model, val_loader,   optimizer, device,
+                            args.kl_weight, beat_w, args.low_freq_cutoff, train=False)
+        scheduler.step(val_m['total'])
+
+        history.append({'epoch': epoch, 'train': train_m, 'val': val_m,
+                        'beat_w': beat_w, 'lr': optimizer.param_groups[0]['lr']})
+
+        # Always save latest
+        torch.save({'model_state_dict': model.state_dict(),
+                    'epoch': epoch, 'val_regularity': val_m['regularity']},
+                   latest_path)
+
+        # Save best (highest beat regularity on val set)
+        if val_m['regularity'] > best_reg:
+            best_reg = val_m['regularity']
+            torch.save({'model_state_dict': model.state_dict(),
+                        'epoch': epoch, 'val_regularity': best_reg},
+                       best_path)
+            star = ' ★ BEST'
+        else:
+            star = ''
+
+        if epoch % args.log_interval == 0 or epoch == 1 or epoch == args.epochs:
+            elapsed = time.time() - t0
+            print(f'Epoch {epoch:3d}/{args.epochs} '
+                  f'| train beat={train_m["beat"]:.4f} reg={train_m["regularity"]:.3f} '
+                  f'| val beat={val_m["beat"]:.4f} reg={val_m["regularity"]:.3f} '
+                  f'| beat_w={beat_w:.2f} | {elapsed:.0f}s{star}')
+
+    # Save training history
+    with open(os.path.join(args.save_dir, 'history_v2.json'), 'w') as f:
+        json.dump(history, f, indent=2)
+
+    print(f'\nDone!  Best val regularity: {best_reg:.4f}')
+    print(f'Best model saved to: {best_path}')
+
+
+if __name__ == '__main__':
+    main()

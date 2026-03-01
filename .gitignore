@@ -43,7 +43,7 @@ evaluation/
 
 # Jupyter
 .ipynb_checkpoints/
-*.ipynb
+# *.ipynb  ← allow notebooks to be committed
 
 # Data and temporary files
 *.csv
