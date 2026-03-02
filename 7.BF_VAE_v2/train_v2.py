@@ -125,7 +125,7 @@ def compute_losses(recon, target, mu, logvar,
 def run_epoch(model, loader, optimizer, device, kl_w, beat_w,
               low_freq_cutoff, train=True):
     model.train(train)
-    totals = {'total': 0, 'recon': 0, 'kl': 0, 'beat': 0, 'regularity': 0}
+    totals = {'total': 0, 'recon': 0, 'kl': 0, 'kl_raw': 0, 'beat': 0, 'regularity': 0}
     n = 0
 
     ctx = torch.enable_grad() if train else torch.no_grad()
@@ -241,7 +241,7 @@ def main():
 
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, patience=5, factor=0.5, verbose=True)
+        optimizer, patience=5, factor=0.5)
 
     # ── training loop ─────────────────────────────────────────────────────
     history     = []

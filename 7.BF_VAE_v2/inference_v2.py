@@ -89,9 +89,16 @@ def chunk_audio(y: np.ndarray,
         end = min(start + chunk_len, total)
         chunk = y[start:end]
 
-        # Zero-pad last chunk if short
+        # Fade-out then zero-pad last chunk so VAE sees a clean silence transition.
+        # Use a long fade (up to 1.5 s) so Griffin-Lim sees a smooth decay and
+        # does not generate ringing artifacts that bleed back into the valid region.
         if len(chunk) < chunk_len:
-            chunk = np.pad(chunk, (0, chunk_len - len(chunk)))
+            orig_len  = len(chunk)
+            fade_len  = min(int(1.5 * SR), orig_len // 2)   # up to 1.5 s fade
+            fade      = np.linspace(1.0, 0.0, fade_len, dtype=np.float32)
+            chunk     = chunk.astype(np.float32).copy()
+            chunk[-fade_len:] *= fade
+            chunk = np.pad(chunk, (0, chunk_len - orig_len))
 
         chunks.append((chunk, start, end))
         if end >= total:
@@ -166,10 +173,11 @@ def detect_beat_strength(y: np.ndarray, chunk_sec: float = CHUNK_SEC) -> dict:
 def enhance_beats(
     input_path:      str,
     checkpoint_path: str,
-    output_path:     str  = None,
-    plot_path:       str  = None,
-    latent_dim:      int  = 128,
-    device_str:      str  = 'auto',
+    output_path:     str   = None,
+    plot_path:       str   = None,
+    latent_dim:      int   = 128,
+    device_str:      str   = 'auto',
+    blend:           float = 0.5,   # 0=keep original, 1=full VAE output
 ) -> dict:
     """
     Full pipeline: load → detect → enhance (chunk-by-chunk) → reconstruct.
@@ -213,8 +221,11 @@ def enhance_beats(
     chunks_out = []
     reg_out_scores = []
 
+    chunk_len = int(CHUNK_SEC * SR)
     with torch.no_grad():
         for i, (chunk, start, end) in enumerate(chunks_in):
+            real_samples = end - start        # actual audio before any padding
+
             mel_in = audio_to_mel(chunk)                           # (128, 431)
             t_in   = torch.FloatTensor(mel_in).unsqueeze(0).unsqueeze(0).to(device)
 
@@ -222,18 +233,42 @@ def enhance_beats(
             if t_out.shape[-1] != N_FRAMES:
                 t_out = t_out[:, :, :, :N_FRAMES]
 
-            mel_out    = t_out.squeeze().cpu().numpy()
-            audio_out  = mel_to_audio(mel_out)
+            # Blend VAE output with original mel to preserve music identity
+            mel_out_vae = t_out.squeeze().cpu().numpy()
+            mel_out     = blend * mel_out_vae + (1.0 - blend) * mel_in
+            audio_out   = mel_to_audio(mel_out)   # full 10 s Griffin-Lim output
             reg_out_scores.append(compute_regularity_score(t_out.cpu()))
+
+            # If this chunk was zero-padded (tail chunk), silence everything
+            # beyond the real audio length so Griffin-Lim ringing is inaudible.
+            if real_samples < chunk_len:
+                keep = real_samples
+                fade_len = min(int(1.5 * SR), keep)
+                audio_out = audio_out.copy()
+                audio_out[keep:] = 0.0
+                audio_out[keep - fade_len:keep] *= np.linspace(1.0, 0.0, fade_len,
+                                                                dtype=np.float32)
 
             chunks_out.append((audio_out, start, end))
             print(f'  Chunk {i+1:2d}/{len(chunks_in)}  '
-                  f'reg: {detection["per_chunk_scores"][i]:.3f} → '
-                  f'{reg_out_scores[-1]:.3f}')
+                  f'reg_out: {reg_out_scores[-1]:.3f}'
+                  + (f'  [tail: {real_samples/SR:.1f}s real]'
+                     if real_samples < chunk_len else ''))
 
     # ── reconstruct full audio ─────────────────────────────────────────────
     print('\n[3/3] Reconstructing full audio...')
     y_out = overlap_add(chunks_out, len(y_in))
+
+    # Fade-out the final 3 s of output audio.
+    # Griffin-Lim STFT edge effects degrade the last ~1 s; the 3 s window
+    # ensures the noisy tail is fully silenced before the listener hears it.
+    fade_samples = min(int(3.0 * SR), len(y_out) // 5)
+    y_out[-fade_samples:] *= np.linspace(1.0, 0.0, fade_samples, dtype=np.float32)
+
+    # Normalise to peak 0.85 so the output is always audible
+    peak = np.max(np.abs(y_out))
+    if peak > 1e-6:
+        y_out = y_out / peak * 0.85
 
     # ── metrics ───────────────────────────────────────────────────────────
     reg_in  = detection['mean_regularity']
@@ -356,8 +391,10 @@ def parse_args():
     p.add_argument('--checkpoint', required=True)
     p.add_argument('--output',     default=None, help='Output .wav path')
     p.add_argument('--plot',       default=None, help='Output .png path')
-    p.add_argument('--latent_dim', type=int, default=128)
+    p.add_argument('--latent_dim', type=int,   default=128)
     p.add_argument('--device',     default='auto')
+    p.add_argument('--blend',      type=float, default=0.5,
+                   help='Mix ratio: 0=original only, 1=full VAE (default 0.5)')
     return p.parse_args()
 
 
@@ -374,4 +411,5 @@ if __name__ == '__main__':
         plot_path       = out_p,
         latent_dim      = args.latent_dim,
         device_str      = args.device,
+        blend           = args.blend,
     )
