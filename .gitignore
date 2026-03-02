@@ -35,11 +35,11 @@ test_music/
 *.flac
 
 # Training outputs
-checkpoints/
+# checkpoints/  # tracked via Git LFS
 logs/
 evaluation/
 *.pt
-*.pth
+# *.pth  # tracked via Git LFS
 
 # Jupyter
 .ipynb_checkpoints/
