@@ -59,3 +59,6 @@ evaluation/
 *.aux
 *.log
 *.out
+
+# Excluded from repo (local only)
+模型判断逻辑.md
